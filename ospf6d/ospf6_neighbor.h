@@ -33,6 +33,9 @@ extern unsigned char conf_debug_ospf6_neighbor;
 #define IS_OSPF6_DEBUG_NEIGHBOR(level) \
   (conf_debug_ospf6_neighbor & OSPF6_DEBUG_NEIGHBOR_ ## level)
 
+#define TRUE 1
+#define FALSE 0
+
 /* Neighbor structure */
 struct ospf6_neighbor
 {
@@ -93,6 +96,10 @@ struct ospf6_neighbor
   struct thread *thread_send_lsreq;
   struct thread *thread_send_lsupdate;
   struct thread *thread_send_lsack;
+
+  u_int32_t high_order_seqnum;		/* higher order Cryptographic Sequence Number */
+  u_int32_t low_order_seqnum;		/* lower order Cryptographic Sequence Number */
+  u_int8_t is_set_at;			/* information of AT bit in hello and db packet */
 };
 
 /* Neighbor state */
@@ -116,7 +123,7 @@ void ospf6_neighbor_dbex_init (struct ospf6_neighbor *on);
 struct ospf6_neighbor *ospf6_neighbor_lookup (u_int32_t,
                                               struct ospf6_interface *);
 struct ospf6_neighbor *ospf6_neighbor_create (u_int32_t,
-                                              struct ospf6_interface *);
+                                              struct ospf6_interface *, struct ospfv3_crypt *); 
 void ospf6_neighbor_delete (struct ospf6_neighbor *);
 
 /* Neighbor event */

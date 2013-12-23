@@ -22,6 +22,8 @@
 #ifndef OSPF6_MESSAGE_H
 #define OSPF6_MESSAGE_H
 
+#include "cryptohash.h"
+
 #define OSPF6_MESSAGE_BUFSIZ  4096
 
 /* Debug option */
@@ -59,6 +61,23 @@ struct ospf6_header
 };
 
 #define OSPF6_MESSAGE_END(H) ((caddr_t) (H) + ntohs ((H)->length))
+
+#define AUTH_TRAILER_HEADER         	16U  
+#define OSPF6_AUTH_NULL             	0    
+#define OSPF6_AUTH_CRYPTOGRAPHIC    	1   
+
+/* Authentication Trailer Structure */
+struct ospfv3_crypt             
+{
+  u_int16_t   auth_type; 
+  u_int16_t   auth_data_length;
+  u_int16_t   reserved;
+  u_int16_t   sa_id;
+  u_int32_t   high_order_seqnum;
+  u_int32_t   low_order_seqnum;
+  u_char auth_data[HASH_SIZE_MAX];
+
+};
 
 /* Hello */
 #define OSPF6_HELLO_MIN_SIZE                  20U
@@ -116,8 +135,8 @@ struct ospf6_lsupdate
 /* It is just a sequence of LSA Headers */
 
 /* Function definition */
-extern void ospf6_hello_print (struct ospf6_header *);
-extern void ospf6_dbdesc_print (struct ospf6_header *);
+extern void ospf6_hello_print (struct ospf6_header * , struct ospfv3_crypt *);   
+extern void ospf6_dbdesc_print (struct ospf6_header * , struct ospfv3_crypt *);
 extern void ospf6_lsreq_print (struct ospf6_header *);
 extern void ospf6_lsupdate_print (struct ospf6_header *);
 extern void ospf6_lsack_print (struct ospf6_header *);

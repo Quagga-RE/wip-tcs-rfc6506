@@ -105,6 +105,14 @@ struct ospf6_interface
 
   /* prefix-list name to filter connected prefix */
   char *plist_name;
+
+  u_int32_t high_order_seqnum;	    /* higher order Cryptographic Sequence Number */
+  u_int32_t low_order_seqnum;	    /* lower order Cryptographic Sequence Number */
+  int hash_algo;                    /* hash algorithm type */
+  u_int8_t auth_type;               /* OSPFv3 authentication type for interface */ 
+  char *auth_str;		    /* OSPFv3 authentication string */
+  char *key_chain;                  /* OSPFv3 authentication key chain */
+
 };
 
 /* interface state */

@@ -217,6 +217,7 @@ struct memory_list memory_list_ospf6[] =
 {
   { MTYPE_OSPF6_TOP,          "OSPF6 top"			},
   { MTYPE_OSPF6_AREA,         "OSPF6 area"			},
+  { MTYPE_OSPF6_CRYPT_KEY,    "OSPF6 crypt key"         	},
   { MTYPE_OSPF6_IF,           "OSPF6 interface"			},
   { MTYPE_OSPF6_NEIGHBOR,     "OSPF6 neighbor"			},
   { MTYPE_OSPF6_ROUTE,        "OSPF6 route"			},

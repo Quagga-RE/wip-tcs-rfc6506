@@ -60,6 +60,12 @@
 
 /* OSPF options */
 /* present in HELLO, DD, LSA */
+#define OSPF6_OPT_SET_AT(x,opt)   ((x)[1] |=  (opt))
+#define OSPF6_OPT_ISSET_AT(x,opt) ((x)[1] &   (opt))
+#define OSPF6_OPT_CLEAR_AT(x,opt) ((x)[1] &= ~(opt))
+
+/* OSPF options */
+/* present in HELLO, DD, LSA */
 #define OSPF6_OPT_SET(x,opt)   ((x)[2] |=  (opt))
 #define OSPF6_OPT_ISSET(x,opt) ((x)[2] &   (opt))
 #define OSPF6_OPT_CLEAR(x,opt) ((x)[2] &= ~(opt))
@@ -71,6 +77,8 @@
 #define OSPF6_OPT_x  (1 << 2)   /* deprecated, former Multicasting Capability */
 #define OSPF6_OPT_E  (1 << 1)   /* AS External Capability */
 #define OSPF6_OPT_V6 (1 << 0)   /* IPv6 forwarding Capability */
+
+#define OSPF6_OPT_AT (1 << 2)   /* Authentication Capability */
 
 /* OSPF6 Prefix */
 #define OSPF6_PREFIX_MIN_SIZE                  4U /* .length == 0 */

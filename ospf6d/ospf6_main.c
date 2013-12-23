@@ -35,6 +35,8 @@
 #include "privs.h"
 #include "sigevent.h"
 #include "zclient.h"
+#include "keychain.h"
+#include "cryptohash.h"
 
 #include "ospf6d.h"
 #include "ospf6_top.h"
@@ -313,6 +315,7 @@ main (int argc, char *argv[], char *envp[])
   vty_init (master);
   memory_init ();
   if_init ();
+  keychain_init();
   access_list_init ();
   prefix_list_init ();
 

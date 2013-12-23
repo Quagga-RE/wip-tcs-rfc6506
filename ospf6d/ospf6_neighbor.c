@@ -79,8 +79,11 @@ ospf6_neighbor_lookup (u_int32_t router_id,
 }
 
 /* create ospf6_neighbor */
+
+/* ospf6_at added as parameter in order to update sequence no. */
+
 struct ospf6_neighbor *
-ospf6_neighbor_create (u_int32_t router_id, struct ospf6_interface *oi)
+ospf6_neighbor_create (u_int32_t router_id, struct ospf6_interface *oi, struct ospfv3_crypt *ospf6_at)   
 {
   struct ospf6_neighbor *on;
   char buf[16];
@@ -110,6 +113,13 @@ ospf6_neighbor_create (u_int32_t router_id, struct ospf6_interface *oi)
   on->lsreq_list = ospf6_lsdb_create (on);
   on->lsupdate_list = ospf6_lsdb_create (on);
   on->lsack_list = ospf6_lsdb_create (on);
+  /* if Authentication is enabled, auth_type will be non-zero value, it will update the higher and lower cryt seq no. */
+  if(ospf6_at->auth_type)
+  {
+    on->low_order_seqnum = ospf6_at->low_order_seqnum;
+    on->high_order_seqnum = ospf6_at->high_order_seqnum;
+    on->is_set_at = TRUE;
+  }
 
   listnode_add_sort (oi->neighbor_list, on);
   return on;

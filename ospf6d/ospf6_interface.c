@@ -29,6 +29,19 @@
 #include "prefix.h"
 #include "plist.h"
 
+#include "sockunion.h"
+#include "network.h"
+#include "table.h"
+#include "stream.h"
+#include "zclient.h"
+#include "filter.h"
+#include "sockopt.h"
+#include "privs.h"
+#include "cryptohash.h"
+#include "keychain.h"
+
+#include "zebra/connected.h"
+
 #include "ospf6_lsa.h"
 #include "ospf6_lsdb.h"
 #include "ospf6_network.h"
@@ -41,6 +54,7 @@
 #include "ospf6_intra.h"
 #include "ospf6_spf.h"
 #include "ospf6d.h"
+#include "memtypes.h"
 
 unsigned char conf_debug_ospf6_interface = 0;
 
@@ -140,6 +154,14 @@ ospf6_interface_create (struct interface *ifp)
 
   oi->route_connected = OSPF6_ROUTE_TABLE_CREATE (INTERFACE, CONNECTED_ROUTES);
   oi->route_connected->scope = oi;
+
+  if (oi->key_chain)
+	XFREE (MTYPE_OSPF6_CRYPT_KEY, oi->key_chain);
+
+  oi->low_order_seqnum = time (NULL);
+  oi->high_order_seqnum = 0;
+  oi->auth_type = 0;
+  oi->hash_algo = 0;
 
   /* link both */
   oi->interface = ifp;
@@ -839,6 +861,7 @@ ospf6_interface_show (struct vty *vty, struct interface *ifp)
 
   return 0;
 }
+
 
 /* show interface */
 DEFUN (show_ipv6_ospf6_interface,
@@ -1682,10 +1705,156 @@ DEFUN (no_ipv6_ospf6_advertise_prefix_list,
   return CMD_SUCCESS;
 }
 
+DEFUN (ipv6_ospf6_sha_authentication_mode,
+       ipv6_ospf6_sha_authentication_mode_cmd,
+       "ipv6 ospf6 authentication mode (sha1|sha256|sha384|sha512|default)",
+       "IPv6 Information\n"
+       "OSPF6 interface commands\n"
+       "Authentication mode\n"
+       "HMAC-SHA-1 authentication\n"
+       "HMAC-SHA-256 authentication\n"
+       "HMAC-SHA-384 authentication\n"
+       "HMAC-SHA-512 authentication\n"
+       "Enable SHA algorithm for authentication\n"
+       )
+{
+  struct ospf6_interface *oi;
+  struct interface *ifp;
+  unsigned hash_algo;
+  struct listnode *node, *nnode;	
+  struct list *auth_crypt;		
+  u_char key_id;
+
+  ifp = (struct interface *)vty->index;
+  assert (ifp);
+
+  oi = (struct ospf6_interface *)ifp->info;
+  if (oi == NULL)
+    oi = ospf6_interface_create (ifp);
+  assert (oi);
+
+  /* As per RFC-6506, default sha algorithm is sha-256 */
+  if(strcmp(argv[0],"default")==0)
+	hash_algo = hash_algo_byname ("sha256");
+  else
+  	hash_algo = hash_algo_byname (argv[0]);
+  
+  if (! hash_algo_enabled (hash_algo))
+  {
+    vty_out (vty, "Algorithm '%s' is not enabled in this build%s", argv[0], VTY_NEWLINE);
+    return CMD_ERR_NO_MATCH;
+  }
+  
+  
+  oi->auth_type = OSPF6_AUTH_CRYPTOGRAPHIC;
+  oi->hash_algo = hash_algo;
+  return CMD_SUCCESS;
+}
+
+DEFUN (no_ipv6_ospf6_sha_authentication_mode,
+       no_ipv6_ospf6_sha_authentication_mode_cmd,
+       "no ipv6 ospf6 authentication mode",
+       NO_STR
+       "IPv6 Information\n"
+       "OSPF6 interface commands\n"
+       "Disable SHA algorithm for authentication\n"
+       )
+{
+  struct ospf6_interface *oi;
+  struct interface *ifp;
+
+  ifp = (struct interface *) vty->index;
+  assert (ifp);
+
+  oi = (struct ospf6_interface *) ifp->info;
+  if (oi == NULL)
+  oi = ospf6_interface_create (ifp);
+  assert (oi);
+
+  oi->auth_type = OSPF6_AUTH_NULL ;
+  return CMD_SUCCESS;
+}
+
+ALIAS ( no_ipv6_ospf6_sha_authentication_mode,
+        no_ipv6_ospf6_sha_authentication_mode_type_cmd,
+        "no ipv6 ospf6 authentication mode (sha1|sha256|sha384|sha512)",
+        NO_STR
+        "IPv6 Information\n"
+        "OSPF6 interface commands\n"
+        "Disable SHA algorithm for authentication\n"
+        "HMAC-SHA-1 authentication\n"
+        "HMAC-SHA-256 authentication\n"
+        "HMAC-SHA-384 authentication\n"
+        "HMAC-SHA-512 authentication\n" )
+
+DEFUN (ipv6_ospf6_authentication_key_chain,
+       ipv6_ospf6_authentication_key_chain_cmd,
+       "ipv6 ospf6 authentication key-chain LINE",
+       "IPv6 Information\n"
+       "Authentication control\n"
+       "Authentication key-chain\n"
+       "name of key-chain\n")
+{
+  struct interface *ifp;
+  struct ospf6_interface *oi;
+
+  ifp = (struct interface *) vty->index;
+  assert (ifp);
+
+  oi = (struct ospf6_interface *) ifp->info;
+  
+  if (oi == NULL)
+  oi = ospf6_interface_create (ifp);
+  assert (oi);
+
+  if (keychain_lookup (argv[0]) == NULL)
+  {
+       vty_out (vty, "Keychain '%s' is not configured%s", argv[0], VTY_NEWLINE);
+       return 0;
+  }
+
+  if (oi->key_chain)
+    XFREE (MTYPE_OSPF6_CRYPT_KEY, oi->key_chain);
+
+  oi->key_chain = XSTRDUP (MTYPE_OSPF6_CRYPT_KEY, argv[0]);
+
+  return CMD_SUCCESS;
+}
+
+DEFUN (no_ipv6_ospf6_authentication_key_chain,
+       no_ipv6_ospf6_authentication_key_chain_cmd,
+       "no ipv6 ospf6 authentication key-chain",
+       NO_STR
+       "IPv6 Information\n"
+       "Authentication control\n"
+       "Authentication key-chain\n")
+{
+  struct interface *ifp;
+  struct ospf6_interface *oi;
+
+  ifp = (struct interface *) vty->index;
+  oi = ifp->info;
+
+  if (oi->key_chain)
+    XFREE (MTYPE_OSPF6_CRYPT_KEY, oi->key_chain);
+
+  return CMD_SUCCESS;
+}
+
+ALIAS (no_ipv6_ospf6_authentication_key_chain,
+       no_ipv6_ospf6_authentication_key_chain2_cmd,
+       "no ipv6 ospf6 authentication key-chain LINE",
+       NO_STR
+       "IPv6 Information\n"
+       "Authentication control\n"
+       "Authentication key-chain\n"
+       "name of key-chain\n")
+
 static int
 config_write_ospf6_interface (struct vty *vty)
 {
   struct listnode *i;
+  struct keychain *keychain;
   struct ospf6_interface *oi;
   struct interface *ifp;
 
@@ -1740,6 +1909,29 @@ config_write_ospf6_interface (struct vty *vty)
 
       if (oi->mtu_ignore)
         vty_out (vty, " ipv6 ospf6 mtu-ignore%s", VNL);
+
+      /* OSPFv3 authentication. */
+      if (oi->auth_type == OSPF6_AUTH_NULL)
+	vty_out (vty, " ipv6 ospf6 authentication mode NULL%s", VTY_NEWLINE);
+
+      if (oi->auth_type == OSPF6_AUTH_CRYPTOGRAPHIC)
+        switch (oi->hash_algo)
+        {
+        case HASH_HMAC_SHA1:
+        case HASH_HMAC_SHA256:
+        case HASH_HMAC_SHA384:
+        case HASH_HMAC_SHA512:
+          vty_out (vty, " ipv6 ospf6 authentication mode %s%s",
+                   LOOKUP (hash_algo_cli_str, oi->hash_algo), VTY_NEWLINE);
+          break;
+        default:
+          assert (0);
+        }
+
+      if (oi->key_chain)
+	vty_out (vty, " ipv6 ospf6 authentication key-chain %s%s",
+		 oi->key_chain, VTY_NEWLINE);
+
 
       vty_out (vty, "!%s", VNL);
     }
@@ -1805,6 +1997,14 @@ ospf6_interface_init (void)
 
   install_element (INTERFACE_NODE, &ipv6_ospf6_advertise_prefix_list_cmd);
   install_element (INTERFACE_NODE, &no_ipv6_ospf6_advertise_prefix_list_cmd);
+
+  install_element (INTERFACE_NODE, &ipv6_ospf6_authentication_key_chain_cmd);
+  install_element (INTERFACE_NODE, &no_ipv6_ospf6_authentication_key_chain_cmd);
+  install_element (INTERFACE_NODE, &no_ipv6_ospf6_authentication_key_chain2_cmd);
+  
+  install_element (INTERFACE_NODE, &ipv6_ospf6_sha_authentication_mode_cmd);
+  install_element (INTERFACE_NODE, &no_ipv6_ospf6_sha_authentication_mode_cmd);
+  install_element (INTERFACE_NODE, &no_ipv6_ospf6_sha_authentication_mode_type_cmd);
 }
 
 DEFUN (debug_ospf6_interface,

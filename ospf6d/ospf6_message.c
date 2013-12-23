@@ -27,6 +27,8 @@
 #include "command.h"
 #include "thread.h"
 #include "linklist.h"
+#include "cryptohash.h"
+#include "keychain.h"
 
 #include "ospf6_proto.h"
 #include "ospf6_lsa.h"
@@ -49,6 +51,10 @@
 
 #include <netinet/ip6.h>
 
+/*Initialization of CPID (Cryptographic Protocol ID)*/
+static const uint16_t CPID =1;
+
+
 unsigned char conf_debug_ospf6_message[6] = {0x03, 0, 0, 0, 0, 0};
 static const struct message ospf6_message_type_str [] =
 {
@@ -58,6 +64,18 @@ static const struct message ospf6_message_type_str [] =
   { OSPF6_MESSAGE_TYPE_LSUPDATE, "LSUpdate" },
   { OSPF6_MESSAGE_TYPE_LSACK,    "LSAck"    },
 };
+
+/* Authentication Types */
+static
+const struct message ospf6_auth_type_string[] =
+{
+  { OSPF6_AUTH_NULL,          "Null"          },
+  { OSPF6_AUTH_CRYPTOGRAPHIC, "Cryptographic" },
+};
+
+static const size_t ospf6_auth_type_string_max =
+  sizeof (ospf6_auth_type_string) / sizeof (ospf6_auth_type_string[0]);
+
 static const size_t ospf6_message_type_str_max =
   sizeof (ospf6_message_type_str) / sizeof (ospf6_message_type_str[0]);
 
@@ -104,11 +122,22 @@ ospf6_header_print (struct ospf6_header *oh)
              area_id, ntohs (oh->checksum), oh->instance_id);
 }
 
+void ospf6_print_auth_details(struct ospfv3_crypt *ospf6_at)
+{
+  zlog_debug ("    Auth Type : SHA Cryptographic Authentication");
+  zlog_debug ("    Key ID : %d", ospf6_at->sa_id);
+  zlog_debug ("    Auth Data Len :  %d", ospf6_at->auth_data_length);
+  zlog_debug ("    Higher Sequence number : %ld",
+		 (u_long)ntohl (ospf6_at->high_order_seqnum));
+  zlog_debug ("    Lower Sequence number : %ld",
+		 (u_long)ntohl (ospf6_at->low_order_seqnum));
+}
+
 void
-ospf6_hello_print (struct ospf6_header *oh)
+ospf6_hello_print (struct ospf6_header *oh, struct ospfv3_crypt *ospf6_at)
 {
   struct ospf6_hello *hello;
-  char options[16];
+  char options[36];
   char drouter[16], bdrouter[16], neighbor[16];
   char *p;
 
@@ -121,6 +150,19 @@ ospf6_hello_print (struct ospf6_header *oh)
   inet_ntop (AF_INET, &hello->drouter, drouter, sizeof (drouter));
   inet_ntop (AF_INET, &hello->bdrouter, bdrouter, sizeof (bdrouter));
   ospf6_options_printbuf (hello->options, options, sizeof (options));
+
+  switch (ospf6_at->auth_type)
+  {
+    case OSPF6_AUTH_NULL:
+         zlog_debug ("    Auth Type : Null Authentication");
+         break;
+    case OSPF6_AUTH_CRYPTOGRAPHIC:
+         ospf6_print_auth_details(ospf6_at);
+         break;
+    default:
+         zlog_debug ("*   This is not supported authentication type");
+         break;
+  }
 
   zlog_debug ("    I/F-Id:%ld Priority:%d Option:%s",
              (u_long) ntohl (hello->interface_id), hello->priority, options);
@@ -135,15 +177,14 @@ ospf6_hello_print (struct ospf6_header *oh)
       inet_ntop (AF_INET, (void *) p, neighbor, sizeof (neighbor));
       zlog_debug ("    Neighbor: %s", neighbor);
     }
-
   assert (p == OSPF6_MESSAGE_END (oh));
 }
 
 void
-ospf6_dbdesc_print (struct ospf6_header *oh)
+ospf6_dbdesc_print (struct ospf6_header *oh, struct ospfv3_crypt *ospf6_at)
 {
   struct ospf6_dbdesc *dbdesc;
-  char options[16];
+  char options[36];
   char *p;
 
   ospf6_header_print (oh);
@@ -153,6 +194,19 @@ ospf6_dbdesc_print (struct ospf6_header *oh)
     ((caddr_t) oh + sizeof (struct ospf6_header));
 
   ospf6_options_printbuf (dbdesc->options, options, sizeof (options));
+
+  switch (ospf6_at->auth_type)
+  {
+    case OSPF6_AUTH_NULL:
+         zlog_debug ("    Auth Type : Null Authentication");
+         break;
+    case OSPF6_AUTH_CRYPTOGRAPHIC:
+         ospf6_print_auth_details(ospf6_at);
+         break;
+    default:
+         zlog_debug ("*   This is not supported authentication type");
+         break;
+  }
 
   zlog_debug ("    MBZ: %#x Option: %s IfMTU: %hu",
              dbdesc->reserved1, options, ntohs (dbdesc->ifmtu));
@@ -247,9 +301,12 @@ ospf6_hello_recv (struct in6_addr *src, struct in6_addr *dst,
   int twoway = 0;
   int neighborchange = 0;
   int backupseen = 0;
+  struct ospfv3_crypt *ospf6_at ;
 
   hello = (struct ospf6_hello *)
     ((caddr_t) oh + sizeof (struct ospf6_header));
+
+  ospf6_at = (struct ospfv3_crypt *)((caddr_t) oh + ntohs (oh->length));
 
   /* HelloInterval check */
   if (ntohs (hello->hello_interval) != oi->hello_interval)
@@ -280,7 +337,7 @@ ospf6_hello_recv (struct in6_addr *src, struct in6_addr *dst,
   on = ospf6_neighbor_lookup (oh->router_id, oi);
   if (on == NULL)
     {
-      on = ospf6_neighbor_create (oh->router_id, oi);
+      on = ospf6_neighbor_create (oh->router_id, oi , ospf6_at); 
       on->prev_drouter = on->drouter = hello->drouter;
       on->prev_bdrouter = on->bdrouter = hello->bdrouter;
       on->priority = hello->priority;
@@ -1163,6 +1220,23 @@ ospf6_lsaseq_examin
   return MSG_OK;
 }
 
+/* OSPF6 authentication type & AT Bit checking function */
+static int
+ospf6_auth_type (struct ospf6_interface *oi)
+{
+  int auth_type = OSPF6_AUTH_NULL;
+  if(oi->auth_type)
+    auth_type =  OSPF6_AUTH_CRYPTOGRAPHIC;
+
+  /* Handle case where MD5 key list is not configured aka Cisco */
+  if (auth_type == OSPF6_AUTH_CRYPTOGRAPHIC &&
+      oi->key_chain == NULL)
+    return OSPF6_AUTH_NULL;
+
+  return auth_type;
+
+}
+
 /* Verify a complete OSPF packet for proper sizing/alignment. */
 static unsigned
 ospf6_packet_examin (struct ospf6_header *oh, const unsigned bytesonwire)
@@ -1170,6 +1244,7 @@ ospf6_packet_examin (struct ospf6_header *oh, const unsigned bytesonwire)
   struct ospf6_lsupdate *lsupd;
   unsigned test;
   u_int16_t bytesdeclared;
+  struct ospfv3_crypt *ospf6_at;
 
   /* length, 1st approximation */
   if (bytesonwire < OSPF6_HEADER_SIZE)
@@ -1180,13 +1255,28 @@ ospf6_packet_examin (struct ospf6_header *oh, const unsigned bytesonwire)
   }
   /* Now it is safe to access header fields. */
   bytesdeclared = ntohs (oh->length);
-  if (bytesonwire < bytesdeclared)
+  ospf6_at = (struct ospfv3_crypt *)((caddr_t) oh + ntohs (oh->length));
+  if (ospf6_at->auth_type == OSPF6_AUTH_CRYPTOGRAPHIC) //when authentication is cryptographic
+  {
+    if (bytesonwire > ntohs (oh->length) + AUTH_TRAILER_HEADER + HASH_SIZE_MAX)
+    {
+      if (IS_OSPF6_DEBUG_MESSAGE (OSPF6_MESSAGE_TYPE_UNKNOWN, RECV))
+        zlog_debug ("%s: packet length error (%u real, %u declared)",
+                    __func__, bytesonwire, ntohs (oh->length) + AUTH_TRAILER_HEADER + HASH_SIZE_MAX);
+      return MSG_NG;
+    }
+  }
+  else //when authentication is NULL 
+  {
+    if (bytesonwire > ntohs (oh->length))
   {
     if (IS_OSPF6_DEBUG_MESSAGE (OSPF6_MESSAGE_TYPE_UNKNOWN, RECV))
       zlog_debug ("%s: packet length error (%u real, %u declared)",
                   __func__, bytesonwire, bytesdeclared);
     return MSG_NG;
   }
+  }
+
   /* version check */
   if (oh->version != OSPFV3_VERSION)
   {
@@ -1194,7 +1284,9 @@ ospf6_packet_examin (struct ospf6_header *oh, const unsigned bytesonwire)
       zlog_debug ("%s: invalid (%u) protocol version", __func__, oh->version);
     return MSG_NG;
   }
-  /* length, 2nd approximation */
+
+  /* Length, 2nd approximation. The type-specific constraint is checked
+     against declared length, not amount of bytes on wire. As done in ospfv2 */
   if
   (
     oh->type < OSPF6_MESSAGE_TYPE_ALL &&
@@ -1270,6 +1362,7 @@ ospf6_packet_examin (struct ospf6_header *oh, const unsigned bytesonwire)
   return test;
 }
 
+
 /* Verify particular fields of otherwise correct received OSPF packet to
    meet the requirements of RFC. */
 static int
@@ -1313,6 +1406,214 @@ ospf6_rxpacket_examin (struct ospf6_interface *oi, struct ospf6_header *oh, cons
     return MSG_NG;
   }
   return MSG_OK;
+}
+
+
+static int
+ospf6_check_sha_digest(struct ospf6_interface *oi, struct ospf6_header *oh,
+                       struct ospfv3_crypt *ospf6_at,struct in6_addr *src)
+{
+  int i;
+  uint8_t local_dlen=hash_digest_length[oi->hash_algo];
+  uint8_t key_len; 
+  uint8_t auth_key_len;
+  size_t compr_authlen;
+  uint8_t Apad[local_dlen];
+  unsigned hash_algo;
+  u_char received_auth_data[local_dlen];
+  u_char output[local_dlen];
+  unsigned hash_error;
+  struct ospf6_neighbor *on;
+  oh->checksum=0;
+  struct keychain *keychain;
+  struct key *key;
+  char *ks;
+  char *auth_str = NULL;
+  u_int8_t compr_auth_str[HASH_SIZE_MAX];
+  
+  /* Check crypto seqnum. As done in ospfv2 */
+  on = ospf6_neighbor_lookup (oh->router_id, oi);
+
+  if (on && ntohl(on->high_order_seqnum) > ntohl(ospf6_at->high_order_seqnum))
+  {
+    zlog_warn ("Interface %s: %s Bad High-order-sequence %d (expect %d)",
+               oi->interface->name, __func__,
+               ntohl(ospf6_at->high_order_seqnum), ntohl(on->ospf6_if->high_order_seqnum));
+    return 0;
+  }
+    
+  if (on && ntohl(on->high_order_seqnum) == ntohl(ospf6_at->high_order_seqnum)
+      && ntohl(on->low_order_seqnum) >= ntohl(ospf6_at->low_order_seqnum))
+  {
+    zlog_warn ("Interface %s: %s Bad Low-order-sequence %d (expect %d)",
+               oi->interface->name, __func__,
+               ntohl(ospf6_at->low_order_seqnum), ntohl(on->ospf6_if->low_order_seqnum));
+    return 0;
+  }
+
+  /* pick local key */
+  if (oi->key_chain)
+  {
+    if ((keychain = keychain_lookup (oi->key_chain)) == NULL)
+    {
+      zlog_debug ("key chain '%s' is configured, but does not exist", oi->key_chain);
+      return 0;
+    }
+    if ((key = key_lookup_for_accept (keychain, ntohs (ospf6_at->sa_id))) == NULL)
+    {
+      zlog_debug ("key %u lookup failed", ntohs (ospf6_at->sa_id));
+      return 0;
+    }
+    zlog_debug ("using keychain '%s', key %u for receiving", oi->key_chain, key->index);
+    auth_str = key->string;
+  }
+  if (auth_str == NULL)
+  {
+    zlog_debug ("authentication string lookup failed");
+    return 0;
+  }
+
+  auth_key_len = strlen(auth_str);
+  
+  /* As per RFC-6506 Sec 4.5, Apad is a value that is the same length as the hash
+   * output or message digest. The first 16 octets contain the IPv6 source address
+   * followed by the hexadecimal value 0x878FE1F3 repeated (L-16)/4 times.
+   * This implies that hash output is always a length of at least 16 octets.*/
+  
+  memset (Apad,0, sizeof(Apad));
+  memcpy (Apad,src, sizeof (struct in6_addr));	
+  memcpy (Apad + sizeof (struct in6_addr), hash_apad_sha512, local_dlen-16);
+
+  /* Method to (create ks) Function for appending CPID to Authentication key K to form Ks */
+  ks = malloc (auth_key_len + sizeof(CPID));
+  if (ks == NULL)
+	return 0;
+  memset(ks, 0, sizeof(ks));
+  memcpy(ks, auth_str, auth_key_len);
+  memcpy(ks + auth_key_len, &CPID, sizeof(CPID));
+	
+  key_len = auth_key_len + sizeof(CPID);
+
+  memcpy (received_auth_data, ospf6_at->auth_data, local_dlen);
+  
+  /* OSPFv3 Authentication Process Starts*/
+  hash_key_compress_rfc4822 (oi->hash_algo, ks, key_len, compr_auth_str, &compr_authlen);
+  memset (ospf6_at->auth_data, 0, sizeof(Apad));
+  memcpy (ospf6_at->auth_data, Apad, sizeof(Apad));
+  hash_error = hash_make_hmac (oi->hash_algo, oh, sizeof(oh), compr_auth_str, compr_authlen, output);
+  memcpy (ospf6_at->auth_data, output, hash_digest_length[oi->hash_algo]);
+
+  if (hash_error)
+  {
+    zlog_debug ("hash function returned error %u", hash_error);
+    free(ks);
+    return 0;
+  }
+  /* Compare the local and received digests */
+  if (memcmp (ospf6_at->auth_data , received_auth_data, hash_digest_length[oi->hash_algo]))
+  {
+    zlog_warn ("interface %s: %s digest mismatch", oi->interface->name, __func__);
+    free(ks);
+    return 0;
+  }
+    
+  /* save neighbor's crypt_seqnum */
+  if (on)
+  {
+    on->low_order_seqnum = ospf6_at->low_order_seqnum;
+    on->high_order_seqnum = ospf6_at->high_order_seqnum;
+  }
+  free(ks);
+  return 1;
+}
+
+static int
+ospf6_check_auth (struct ospf6_interface *oi, struct ospf6_header *oh,
+                  struct ospfv3_crypt *ospf6_at, struct in6_addr *src)
+{
+  struct ospf6_hello *hello;
+  struct ospf6_dbdesc *dbdesc;
+  u_int16_t iface_auth_type; 			//local auth type
+  u_int16_t pkt_auth_type = OSPF6_AUTH_NULL;    //received auth type
+  struct ospf6_neighbor *on;
+
+  on = ospf6_neighbor_lookup (oh->router_id, oi);
+  if (on == NULL)
+  {
+    zlog_debug ("Neighbor not found, ignore");
+    return;
+  }
+
+  hello = (struct ospf6_hello *)
+    ((caddr_t) oh + sizeof (struct ospf6_header));       
+
+  dbdesc = (struct ospf6_dbdesc *)
+    ((caddr_t) oh + sizeof (struct ospf6_header));       
+
+  /* case when AT Bit is set at sender but key is not specified, auth_type is considered to be NULL */
+  switch (oh->type)
+  {
+    case OSPF6_MESSAGE_TYPE_HELLO:
+    case OSPF6_MESSAGE_TYPE_DBDESC:
+	 if((OSPF6_OPT_ISSET_AT(hello->options,OSPF6_OPT_AT) 
+             || OSPF6_OPT_ISSET_AT(dbdesc->options ,OSPF6_OPT_AT))
+             && (ospf6_at->auth_type == OSPF6_AUTH_CRYPTOGRAPHIC))  
+    	 {
+      	   pkt_auth_type =  OSPF6_AUTH_CRYPTOGRAPHIC;
+	   on->is_set_at = TRUE;
+	 }
+         break;
+    case OSPF6_MESSAGE_TYPE_LSREQ:
+    case OSPF6_MESSAGE_TYPE_LSUPDATE:
+    case OSPF6_MESSAGE_TYPE_LSACK:
+         if(on->is_set_at == TRUE)  
+      	   pkt_auth_type =  OSPF6_AUTH_CRYPTOGRAPHIC;
+     	 break;
+    default:
+         zlog_debug ("Unknown message");
+	 break;
+  }
+  
+  switch (pkt_auth_type)
+  {
+    case OSPF6_AUTH_NULL: 
+         if (OSPF6_AUTH_NULL != (iface_auth_type = ospf6_auth_type (oi)))
+         {
+           if (IS_OSPF6_DEBUG_MESSAGE (oh->type, RECV))
+             zlog_warn ("interface %s: auth-type mismatch, local %s, rcvd Null", 
+                        oi->interface->name, LOOKUP(ospf6_auth_type_string, iface_auth_type));
+           return MSG_NG;
+         }
+    	 return MSG_OK;
+    case OSPF6_AUTH_CRYPTOGRAPHIC: 
+         if (OSPF6_AUTH_CRYPTOGRAPHIC != (iface_auth_type = ospf6_auth_type (oi)))
+         {
+           if (IS_OSPF6_DEBUG_MESSAGE (oh->type, RECV))
+             zlog_warn ("interface %s: auth-type mismatch, local %s, rcvd Cryptographic",
+               oi->interface->name, LOOKUP (ospf6_auth_type_string, iface_auth_type));
+           return MSG_NG;
+         }
+
+    /* As per RFC 6506 sec 4.2, Checksum verification should be omitted, if it 
+     * does not include a non-zero checksum, it will not be modified by the 
+     * receiver and simply be included in calculation of Authentication Trailer
+     * message digest */
+      
+    /* SHA crypto method can pass ospf6_packet_examin() */
+
+    if (! ospf6_check_sha_digest (oi, oh,ospf6_at,src))
+    {
+      if (IS_OSPF6_DEBUG_MESSAGE (oh->type, RECV))
+        zlog_warn ("interface %s: %s failed", oi->interface->name, __func__);
+      return MSG_NG;
+    }
+    return MSG_OK;
+    default:
+         if (IS_OSPF6_DEBUG_MESSAGE (oh->type, RECV))
+           zlog_warn ("interface %s: invalid packet auth-type (%02x)",
+             oi->interface->name, pkt_auth_type);
+         return MSG_NG;
+  }
 }
 
 static void
@@ -1535,6 +1836,7 @@ ospf6_receive (struct thread *thread)
   struct iovec iovector[2];
   struct ospf6_interface *oi;
   struct ospf6_header *oh;
+  struct ospfv3_crypt *ospf6_at;
 
   /* add next read thread */
   sockfd = THREAD_FD (thread);
@@ -1576,6 +1878,14 @@ ospf6_receive (struct thread *thread)
   if (ospf6_rxpacket_examin (oi, oh, len) != MSG_OK)
     return 0;
 
+  /* Check Authentication of data */
+
+  /* ospf6_at can create problem when AT bit is not set */
+  ospf6_at = (struct ospfv3_crypt *)((caddr_t) oh + ntohs (oh->length)); // Value of ospf6_at for received packet
+
+    if (ospf6_check_auth (oi, oh,ospf6_at,&src)!= MSG_OK)
+    return 0;
+
   /* Log */
   if (IS_OSPF6_DEBUG_MESSAGE (oh->type, RECV))
     {
@@ -1589,10 +1899,10 @@ ospf6_receive (struct thread *thread)
       switch (oh->type)
         {
           case OSPF6_MESSAGE_TYPE_HELLO:
-            ospf6_hello_print (oh);
+            ospf6_hello_print (oh, ospf6_at);
             break;
           case OSPF6_MESSAGE_TYPE_DBDESC:
-            ospf6_dbdesc_print (oh);
+            ospf6_dbdesc_print (oh, ospf6_at);
             break;
           case OSPF6_MESSAGE_TYPE_LSREQ:
             ospf6_lsreq_print (oh);
@@ -1638,6 +1948,142 @@ ospf6_receive (struct thread *thread)
 }
 
 static void
+ospf6_make_sha_digest (struct in6_addr *src,struct ospf6_interface *oi,
+                       struct ospf6_header *oh, struct ospfv3_crypt *ospf6_at, char *auth_str)
+{
+  int i;
+  unsigned hash_algo;
+  uint8_t dlen=hash_digest_length[oi->hash_algo];
+  uint8_t Apad[dlen];
+  u_char output[dlen];
+  uint8_t auth_key_len;
+  size_t compr_authlen;
+  uint8_t key_len;
+  struct in6_addr src_temp;
+  u_int8_t compr_auth_str[HASH_SIZE_MAX];
+  unsigned hash_error;
+  char *ks;
+  struct keychain *keychain;
+  struct key *key = NULL;
+ 
+  auth_key_len = strlen(auth_str);
+
+  /* As per RFC-6506, Apad is a value that is the same length as the hash output
+   * or message digest. The first 16 octets contain the IPv6 source address followed
+   * by the hexadecimal value 0x878FE1F3 repeated (L-16)/4 times.
+   * This implies that hash output is always a length of at least 16 octets. */
+  memset(Apad,0, sizeof(Apad));
+  memset(&src_temp,0,sizeof(struct in6_addr));
+
+  if(src)
+    memcpy(Apad,src, sizeof (struct in6_addr));   
+  else
+    memcpy(Apad,&src_temp, sizeof (struct in6_addr));
+ 
+  memcpy(Apad + sizeof (struct in6_addr), hash_apad_sha512, dlen-16); 
+
+  /*Method to (create ks) Function for appending CPID to Authentication key K to form Ks*/
+  ks = malloc(auth_key_len+sizeof(CPID));
+  if (ks == NULL)
+    return 0;
+  memset(ks, 0, sizeof(ks));
+  memcpy(ks, auth_str, auth_key_len);
+  memcpy(ks + auth_key_len, &CPID, sizeof(CPID));
+  key_len = auth_key_len + sizeof(CPID);
+
+  /* OSPFv3 Authentication Process Starts*/
+  hash_key_compress_rfc4822 (oi->hash_algo, ks, key_len, compr_auth_str, &compr_authlen);
+  memcpy( ospf6_at->auth_data, Apad, sizeof(Apad));
+  hash_error = hash_make_hmac (oi->hash_algo, oh, sizeof(oh), compr_auth_str, compr_authlen, output);
+  memcpy( ospf6_at->auth_data, output, hash_digest_length[oi->hash_algo] );
+
+  if (hash_error)
+  {
+    zlog_debug ("hash function returned error %u", hash_error);
+    free(ks);
+    return 0;
+  }
+  free(ks);
+}
+
+
+static void
+ospf6_make_auth (struct in6_addr *src, struct ospf6_interface *oi,
+                 struct ospf6_header *oh, struct ospfv3_crypt *ospf6_at)
+{
+  u_int32_t t;
+  ospf6_at->auth_type = OSPF6_AUTH_CRYPTOGRAPHIC ;  /* Setting of auth type */
+  ospf6_at->reserved = 0;        		    /* Setting of reserved field to 0 */
+  struct key *key = NULL;
+  char *auth_str = NULL;
+
+  if (ospf6_at->auth_type == OSPF6_AUTH_CRYPTOGRAPHIC)
+  {
+    if (oi->key_chain)
+    {
+      struct keychain *keychain;
+      keychain = keychain_lookup (oi->key_chain);
+      if (keychain)
+      {
+        key = key_lookup_for_send (keychain);
+      }
+      else
+      {
+        zlog_debug ("key chain '%s' is configured, but does not exist", oi->key_chain);
+      }
+    }
+    /* Pick correct auth string for sending */
+    if (key && key->string)
+    {
+      zlog_debug ("using keychain '%s'", oi->key_chain);
+      auth_str = key->string;
+    }
+    if (auth_str == NULL)
+    {
+      zlog_debug ("authentication string lookup failed");
+      return -1;
+    }
+
+    ospf6_at->sa_id = htons (key->index);
+  }
+
+  /* Similar to ospfv2 sequence number code */
+  t = (time(NULL) & 0xFFFFFFFF);
+  if (t > oi->low_order_seqnum)
+    oi->low_order_seqnum = t;
+  else
+    oi->low_order_seqnum++;
+
+  /* As per RFC-6506 section 4.1.1 "Sequence Number Wrap" */
+
+  /* For lower order sequence wrap */
+  if(oi->low_order_seqnum == 0xFFFFFFFF)
+  {
+    oi->high_order_seqnum++;
+    oi->low_order_seqnum=0;
+  }
+  /* For higher order sequence wrap...if higher order is filled, reset higher
+   * order and lower order and reset all the keys to 0 */
+  if(oi->high_order_seqnum == 0xFFFFFFFF && oi->low_order_seqnum == 0xFFFFFFFF)
+  {
+    oi->high_order_seqnum = 0;
+    oi->low_order_seqnum = 0;
+    if (oi->key_chain)
+      XFREE (MTYPE_OSPF6_CRYPT_KEY, oi->key_chain);
+  }
+
+  ospf6_at->low_order_seqnum = htonl (oi->low_order_seqnum);
+  ospf6_at->high_order_seqnum = htonl (oi->high_order_seqnum);
+  /* Authentication data length = Authentication trailer (16 octet) 
+				  + 
+                                  Digest (Algorithm specific digest length) */
+  ospf6_at->auth_data_length = htons (AUTH_TRAILER_HEADER + hash_digest_length[oi->hash_algo]);
+  ospf6_make_sha_digest (src,oi,oh,ospf6_at,auth_str);
+
+}
+
+
+static void
 ospf6_send (struct in6_addr *src, struct in6_addr *dst,
             struct ospf6_interface *oi, struct ospf6_header *oh)
 {
@@ -1645,11 +2091,11 @@ ospf6_send (struct in6_addr *src, struct in6_addr *dst,
   char srcname[64], dstname[64];
   struct iovec iovector[2];
 
-  /* initialize */
-  iovector[0].iov_base = (caddr_t) oh;
-  iovector[0].iov_len = ntohs (oh->length);
-  iovector[1].iov_base = NULL;
-  iovector[1].iov_len = 0;
+  struct ospfv3_crypt *ospf6_at ;
+
+  /* Append the Authentication Trailer to OSPFv3 packet */
+
+  ospf6_at = (struct ospfv3_crypt *)((caddr_t) oh + ntohs (oh->length));
 
   /* fill OSPF header */
   oh->version = OSPFV3_VERSION;
@@ -1661,6 +2107,31 @@ ospf6_send (struct in6_addr *src, struct in6_addr *dst,
   oh->instance_id = oi->instance_id;
   oh->reserved = 0;
 
+
+  if(ospf6_auth_type(oi))
+  {
+    /* As per RFC 6506 sec 4.2, Checksum should be set to 0 prior to 
+    calculation of Authentication Trailer message digest */
+
+    oh->checksum = 0; 
+
+    ospf6_make_auth(src,oi, oh,ospf6_at);
+
+    /* initialize */
+    iovector[0].iov_base = (caddr_t) oh;
+    iovector[0].iov_len = ntohs(oh->length) + ntohs (ospf6_at->auth_data_length);
+    iovector[1].iov_base = NULL;
+    iovector[1].iov_len = 0;            
+  }
+  else
+  {  
+    ospf6_at->auth_type = OSPF6_AUTH_NULL;
+    /* initialize */
+    iovector[0].iov_base = (caddr_t) oh;
+    iovector[0].iov_len = ntohs (oh->length);
+    iovector[1].iov_base = NULL;
+    iovector[1].iov_len = 0;
+  }
   /* Log */
   if (IS_OSPF6_DEBUG_MESSAGE (oh->type, SEND))
     {
@@ -1677,10 +2148,10 @@ ospf6_send (struct in6_addr *src, struct in6_addr *dst,
       switch (oh->type)
         {
           case OSPF6_MESSAGE_TYPE_HELLO:
-            ospf6_hello_print (oh);
+            ospf6_hello_print (oh,ospf6_at);
             break;
           case OSPF6_MESSAGE_TYPE_DBDESC:
-            ospf6_dbdesc_print (oh);
+            ospf6_dbdesc_print (oh,ospf6_at);
             break;
           case OSPF6_MESSAGE_TYPE_LSREQ:
             ospf6_lsreq_print (oh);
@@ -1700,8 +2171,15 @@ ospf6_send (struct in6_addr *src, struct in6_addr *dst,
 
   /* send message */
   len = ospf6_sendmsg (src, dst, &oi->interface->ifindex, iovector);
-  if (len != ntohs (oh->length))
+
+    if(ospf6_auth_type(oi)){
+	if (len != (ntohs (oh->length)+ ntohs (ospf6_at->auth_data_length)))
     zlog_err ("Could not send entire message");
+}
+ else
+	{ if (len != ntohs (oh->length))
+    zlog_err ("Could not send entire message");
+	}
 }
 
 static uint32_t
@@ -1710,6 +2188,7 @@ ospf6_packet_max(struct ospf6_interface *oi)
   assert (oi->ifmtu > sizeof (struct ip6_hdr));
   return oi->ifmtu - (sizeof (struct ip6_hdr));
 }
+
 
 int
 ospf6_hello_send (struct thread *thread)
@@ -1745,6 +2224,12 @@ ospf6_hello_send (struct thread *thread)
   hello->options[0] = oi->area->options[0];
   hello->options[1] = oi->area->options[1];
   hello->options[2] = oi->area->options[2];
+
+  if(oi->auth_type)
+  {
+	OSPF6_OPT_SET_AT(hello->options, OSPF6_OPT_AT);
+  }
+
   hello->hello_interval = htons (oi->hello_interval);
   hello->dead_interval = htons (oi->dead_interval);
   hello->drouter = oi->drouter;
@@ -1818,6 +2303,12 @@ ospf6_dbdesc_send (struct thread *thread)
   dbdesc->options[0] = on->ospf6_if->area->options[0];
   dbdesc->options[1] = on->ospf6_if->area->options[1];
   dbdesc->options[2] = on->ospf6_if->area->options[2];
+
+  if(on->ospf6_if->auth_type)
+  {
+        OSPF6_OPT_SET_AT(dbdesc->options, OSPF6_OPT_AT);
+  }
+
   dbdesc->ifmtu = htons (on->ospf6_if->ifmtu);
   dbdesc->bits = on->dbdesc_bits;
   dbdesc->seqnum = htonl (on->dbdesc_seqnum);
@@ -1850,7 +2341,6 @@ ospf6_dbdesc_send (struct thread *thread)
               on->ospf6_if, oh);
   return 0;
 }
-
 int
 ospf6_dbdesc_send_newone (struct thread *thread)
 {
